@@ -2,55 +2,49 @@
 #include <Wire.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <SparkFun_SCD4x_Arduino_Library.h>
+#include <Adafruit_VL53L0X.h>
 
 // ============================ 設定項目 ====================================
-
-// ---- Wi-Fi設定（結果を送信するときに使う） ----
 const char* WIFI_SSID     = "YOUR_WIFI_SSID";
 const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+const char* SERVER_URL = "http://example.com/api/congestion";
 
-// ---- 送信先サーバー設定 ----
-const char* SERVER_URL = "http://example.com/api/occupancy";
-
-// ---- 送信間隔の設定 ----
 const unsigned long SEND_INTERVAL_SEC = 60;
 const unsigned long SEND_INTERVAL_MS = SEND_INTERVAL_SEC * 1000UL;
 
-// ---- センサーのXSHUTピン設定（起動順序をずらすために使う） ----
-const int XSHUT_PIN_A = 25;   // 外側（入口の外）に向けるセンサー
-const int XSHUT_PIN_B = 26;   // 内側（入口の中）に向けるセンサー
+// CO2センサーのしきい値（ppm）
+const int CO2_THRESHOLD_A = 700;
+const int CO2_THRESHOLD_B = 1000;
 
-// ---- センサーAに割り当てる新しいI2Cアドレス ----
-const uint8_t SENSOR_A_ADDRESS = 0x30;   // Bはデフォルトアドレス(0x29)のまま使う
-
-// ---- 人を検知したとみなす距離の設定（mm） ----
+// 距離センサーの設定
+const int XSHUT_PIN_A = 25;
+const int XSHUT_PIN_B = 26;
+const uint8_t SENSOR_A_ADDRESS = 0x30;
 const int DISTANCE_THRESHOLD_MM = 800;
-
-// ---- 通過判定のタイムアウト設定 ----
 const unsigned long CROSS_TIMEOUT_MS = 1500;
 
-// ---- 混雑判定用しきい値の設定（在室人数） ----
+// 人数（距離センサー）のしきい値
 const int OCCUPANCY_THRESHOLD_A = 5;
 const int OCCUPANCY_THRESHOLD_B = 15;
-
 // =========================================================================
 
+SCD4x co2Sensor;
 Adafruit_VL53L0X sensorA = Adafruit_VL53L0X();
 Adafruit_VL53L0X sensorB = Adafruit_VL53L0X();
 
-int currentOccupancy = 0;
 unsigned long lastSendMillis = 0;
+int currentOccupancy = 0;
 
 enum CrossState { STATE_IDLE, STATE_A_FIRST, STATE_B_FIRST };
 CrossState crossState = STATE_IDLE;
 unsigned long crossStateStartMillis = 0;
 
-// ========================= センサー初期化 =================================
+// ---------- 距離センサー関連 ----------
 
-void initSensors() {
+void initDistanceSensors() {
   pinMode(XSHUT_PIN_A, OUTPUT);
   pinMode(XSHUT_PIN_B, OUTPUT);
-
   digitalWrite(XSHUT_PIN_A, LOW);
   digitalWrite(XSHUT_PIN_B, LOW);
   delay(10);
@@ -64,17 +58,12 @@ void initSensors() {
   sensorB.begin();
 }
 
-// ========================= 距離の取得・判定 ===============================
-
 bool isObjectDetected(Adafruit_VL53L0X &sensor) {
   VL53L0X_RangingMeasurementData_t measure;
   sensor.rangingTest(&measure, false);
-
   if (measure.RangeStatus == 4) return false;
   return (measure.RangeMilliMeter < DISTANCE_THRESHOLD_MM);
 }
-
-// ========================= 通過判定処理 ===================================
 
 void updateCrossDetection() {
   bool detectedA = isObjectDetected(sensorA);
@@ -113,20 +102,40 @@ void updateCrossDetection() {
   }
 }
 
-// ========================= 混雑状況の判定 =================================
+// ---------- 判定ロジック ----------
 
-String judgeCongestionStatus(int occupancy) {
+String judgeStatusByCO2(uint16_t co2ppm) {
+  if (co2ppm < CO2_THRESHOLD_A) return "空いている";
+  else if (co2ppm < CO2_THRESHOLD_B) return "普通";
+  else return "混雑";
+}
+
+String judgeStatusByOccupancy(int occupancy) {
   if (occupancy < OCCUPANCY_THRESHOLD_A) return "空いている";
   else if (occupancy < OCCUPANCY_THRESHOLD_B) return "普通";
   else return "混雑";
 }
 
-// ========================= Wi-Fi接続処理 =================================
+int statusToLevel(const String &status) {
+  if (status == "混雑") return 2;
+  else if (status == "普通") return 1;
+  else return 0;
+}
+
+String combineStatus(const String &statusA, const String &statusB) {
+  int worseLevel = max(statusToLevel(statusA), statusToLevel(statusB));
+  if (worseLevel == 2) return "混雑";
+  else if (worseLevel == 1) return "普通";
+  else return "空いている";
+}
+
+// ---------- Wi-Fi関連 ----------
 
 void connectToWiFi() {
   Serial.print("Wi-Fiに接続中");
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
   unsigned long connectStart = millis();
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
@@ -142,9 +151,7 @@ void connectToWiFi() {
   Serial.println(WiFi.localIP());
 }
 
-// ========================= サーバーへ送信 =================================
-
-void sendResultToServer(int occupancy, const String &status) {
+void sendResultToServer(uint16_t co2ppm, int occupancy, const String &status) {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("Wi-Fiが切断されています。再接続します。");
     connectToWiFi();
@@ -158,7 +165,9 @@ void sendResultToServer(int occupancy, const String &status) {
   http.begin(SERVER_URL);
   http.addHeader("Content-Type", "application/json");
 
-  String jsonPayload = "{\"occupancy\": " + String(occupancy) + ", \"status\": \"" + status + "\"}";
+  String jsonPayload = "{\"co2_ppm\": " + String(co2ppm) +
+                        ", \"occupancy\": " + String(occupancy) +
+                        ", \"status\": \"" + status + "\"}";
   Serial.print("送信データ: ");
   Serial.println(jsonPayload);
 
@@ -174,35 +183,61 @@ void sendResultToServer(int occupancy, const String &status) {
   http.end();
 }
 
-// ============================ 初期化処理 =================================
+// ---------- setup / loop ----------
 
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("=== 距離センサーによる入退室カウント 起動 ===");
+  Serial.println("=== CO2センサー + 距離センサー 複合判定 起動 ===");
 
   Wire.begin();
-  initSensors();
+
+  Serial.print("CO2センサーを初期化中...");
+  if (!co2Sensor.begin(Wire)) {
+    Serial.println("CO2センサーが見つかりませんでした。配線を確認してください。");
+  } else {
+    Serial.println("完了");
+  }
+
+  Serial.print("距離センサーを初期化中...");
+  initDistanceSensors();
+  Serial.println("完了");
+
   connectToWiFi();
 
   lastSendMillis = millis() - SEND_INTERVAL_MS;
 }
 
-// ============================ メインループ ===============================
-
 void loop() {
+  // 距離センサーによる人数カウントは常に更新し続ける
   updateCrossDetection();
 
   unsigned long currentMillis = millis();
   if (currentMillis - lastSendMillis < SEND_INTERVAL_MS) return;
   lastSendMillis = currentMillis;
 
-  String status = judgeCongestionStatus(currentOccupancy);
+  uint16_t co2ppm = 0;
+  bool co2DataReady = co2Sensor.readMeasurement();
+  if (co2DataReady) {
+    co2ppm = co2Sensor.getCO2();
+  } else {
+    Serial.println("CO2センサーのデータがまだ準備できていません。");
+  }
 
-  Serial.print("現在の人数: ");
+  String statusByCO2 = co2DataReady ? judgeStatusByCO2(co2ppm) : "空いている";
+  String statusByOccupancy = judgeStatusByOccupancy(currentOccupancy);
+  String finalStatus = combineStatus(statusByCO2, statusByOccupancy);
+
+  Serial.print("CO2濃度: ");
+  Serial.print(co2ppm);
+  Serial.print("ppm（");
+  Serial.print(statusByCO2);
+  Serial.print("） / 人数: ");
   Serial.print(currentOccupancy);
-  Serial.print("人　判定結果: ");
-  Serial.println(status);
+  Serial.print("人（");
+  Serial.print(statusByOccupancy);
+  Serial.print("） → 総合判定: ");
+  Serial.println(finalStatus);
 
-  sendResultToServer(currentOccupancy, status);
+  sendResultToServer(co2ppm, currentOccupancy, finalStatus);
 }
